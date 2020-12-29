@@ -2,7 +2,36 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
-use thread::JoinHandle;
+struct Worker {
+    id: usize,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl Worker {
+    fn new(id: usize, shared_state: Arc<(Mutex<VecDeque<Message>>, Condvar)>) -> Self {
+        let thread = thread::spawn(move || {
+            let (lock, cond) = &*shared_state;
+            loop {
+                let task = {
+                    let mut msg_queue = lock.lock().unwrap();
+                    while msg_queue.is_empty() {
+                        msg_queue = cond.wait(msg_queue).unwrap();
+                    }
+                    msg_queue.pop_front().unwrap()
+                };
+                cond.notify_one();
+                match task {
+                    Message::Task(task) => task(),
+                    Message::Kill => break,
+                }
+            }
+        });
+        Worker {
+            id,
+            thread: Some(thread),
+        }
+    }
+}
 
 enum Message {
     Task(Box<dyn FnOnce() + Send>),
@@ -10,42 +39,22 @@ enum Message {
 }
 
 pub struct Threadpool {
-    pool_size: u32,
-    thread_handles: Vec<JoinHandle<()>>,
+    pool_size: u8,
+    workers: Vec<Worker>,
     shared_state: Arc<(Mutex<VecDeque<Message>>, Condvar)>,
 }
 
 impl Threadpool {
-    pub fn new(pool_size: u32) -> Self {
+    pub fn new(pool_size: u8) -> Self {
         let shared_state = Arc::new((Mutex::new(VecDeque::<Message>::new()), Condvar::new()));
 
-        let thread_handles = (0..pool_size)
-            .map(|_| {
-                let cloned_shared_state = shared_state.clone();
-
-                thread::spawn(move || {
-                    let (ref lock, ref cond) = *cloned_shared_state;
-                    loop {
-                        let task = {
-                            let mut msg_queue = lock.lock().unwrap();
-                            while msg_queue.is_empty() {
-                                msg_queue = cond.wait(msg_queue).unwrap();
-                            }
-                            msg_queue.pop_front().unwrap()
-                        };
-                        cond.notify_one();
-                        match task {
-                            Message::Task(f) => f(),
-                            Message::Kill => break,
-                        }
-                    }
-                })
-            })
+        let workers = (0..pool_size)
+            .map(|id| Worker::new(id as usize, shared_state.clone()))
             .collect();
 
         Self {
-            thread_handles,
             pool_size,
+            workers,
             shared_state,
         }
     }
@@ -73,8 +82,10 @@ impl Drop for Threadpool {
         }
         cond.notify_all();
 
-        self.thread_handles
-            .drain(..)
-            .for_each(|th| th.join().unwrap())
+        for worker in self.workers.iter_mut() {
+            if let Some(thread) = worker.thread.take() {
+                thread.join().unwrap();
+            }
+        }
     }
 }
