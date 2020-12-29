@@ -1,9 +1,10 @@
+extern crate threadpool;
 use std::{thread, time};
 
-mod threadpool;
+use threadpool::Threadpool;
 
 fn main() {
-    let pool = threadpool::Threadpool::new(4);
+    let pool = Threadpool::new(4);
 
     (0..5).for_each(|i| {
         pool.submit(move || {
