@@ -1,7 +1,6 @@
-use std::ops::Deref;
+use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::{collections::VecDeque, sync::MutexGuard};
 
 use thread::JoinHandle;
 
@@ -20,23 +19,21 @@ impl Threadpool {
     pub fn new(pool_size: u32) -> Self {
         let shared_state = Arc::new((Mutex::new(VecDeque::<Message>::new()), Condvar::new()));
 
-        let predicate = |guard: &MutexGuard<VecDeque<Message>>| guard.deref().is_empty();
-
         let thread_handles = (0..pool_size)
             .map(|_| {
-                let cloned = shared_state.clone();
+                let cloned_shared_state = shared_state.clone();
 
                 thread::spawn(move || {
-                    let (ref lock, ref cond) = *cloned;
+                    let (ref lock, ref cond) = *cloned_shared_state;
                     loop {
                         let task = {
-                            let mut task_queue = lock.lock().unwrap();
-                            while predicate(&task_queue) {
-                                task_queue = cond.wait(task_queue).unwrap();
+                            let mut msg_queue = lock.lock().unwrap();
+                            while msg_queue.is_empty() {
+                                msg_queue = cond.wait(msg_queue).unwrap();
                             }
-                            task_queue.pop_front().unwrap()
+                            msg_queue.pop_front().unwrap()
                         };
-                        cond.notify_all();
+                        cond.notify_one();
                         match task {
                             Message::Task(f) => f(),
                             Message::Kill => break,
@@ -57,19 +54,19 @@ impl Threadpool {
     where
         F: FnOnce() + Send + 'static,
     {
-        let (ref lock, ref cond) = *self.shared_state;
+        let (lock, cond) = &*self.shared_state;
         {
             let mut task_queue = lock.lock().unwrap();
             let task = Box::new(f);
             task_queue.push_back(Message::Task(task));
         }
-        cond.notify_all();
+        cond.notify_one();
     }
 }
 
 impl Drop for Threadpool {
     fn drop(&mut self) {
-        let (ref lock, ref cond) = *self.shared_state;
+        let (lock, cond) = &*self.shared_state;
         {
             let mut task_queue = lock.lock().unwrap();
             (0..self.pool_size).for_each(|_| task_queue.push_back(Message::Kill));
